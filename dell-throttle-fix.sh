@@ -3,6 +3,7 @@ set -euo pipefail
 
 PROGRAM_NAME="DellThrottleFix"
 SCRIPT_NAME=$(basename "$0")
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
 
 WORKER="/usr/local/sbin/dell-throttle-fix-worker"
 SERVICE="/etc/systemd/system/dell-throttle-fix.service"
@@ -22,9 +23,10 @@ Usage:
   $SCRIPT_NAME --run-once
   $SCRIPT_NAME --install
   $SCRIPT_NAME --uninstall
+  $SCRIPT_NAME --apply        (internal, used by the systemd service)
 
 Options:
-  --help
+  --help, -h
       Show this help. Running without arguments also shows this help.
 
   --check
@@ -35,11 +37,13 @@ Options:
         - Linux kernel lockdown state
         - msr-tools availability
         - Intel MSR access
-        - HWP support
+        - HWP support and whether HWP is enabled
         - Current and proposed MSR values
         - Current CPU frequency limits
 
-      No packages, files, services or MSRs are changed.
+      The only system change is loading the msr kernel module if it is
+      not loaded yet (not persistent across reboots). No packages, files,
+      services or MSRs are changed.
 
   --status
       Show:
@@ -58,22 +62,34 @@ Options:
       The changes normally last until the next reboot.
 
   --install
-      Install msr-tools if necessary, create the adaptive worker script,
-      install and enable the systemd service, and apply the workaround
-      immediately.
+      Install msr-tools if necessary, install a copy of this script as the
+      worker, install and enable the systemd service, and apply the
+      workaround immediately.
+
+      The service runs at boot and again after resume from suspend or
+      hibernate, because the values can be reset by the firmware or by
+      the intel_pstate driver.
 
   --uninstall
       Disable and remove the systemd service and worker script.
 
       Reboot afterwards to restore the firmware-programmed MSR defaults.
 
+  --apply
+      Internal. Applies the workaround without any extra output or
+      installation. Used by the systemd service.
+
 How it works:
   - Clears bit 38 of IA32_MISC_ENABLE while preserving all other bits.
   - Reads IA32_HWP_CAPABILITIES from each CPU.
   - Extracts the advertised Highest_Performance value.
   - Replaces only the Maximum_Performance field in IA32_HWP_REQUEST.
-  - Leaves BD PROCHOT enabled.
+  - Leaves BD PROCHOT untouched (use other tools for that).
   - Calculates the required values separately for each logical CPU.
+  - Validates all CPUs before writing anything, and verifies each write
+    by reading the value back.
+  - Requires HWP to be enabled (IA32_PM_ENABLE bit 0).
+  - CPUs that are offline have no MSR device and are skipped.
 
 Safety:
   --install and --run-once abort when Secure Boot or Linux kernel
@@ -90,6 +106,54 @@ require_root() {
         echo "ERROR: This operation must be run as root." >&2
         exit 1
     fi
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+# Prints the MSR value as a decimal number.
+read_msr() {
+    local out
+
+    out=$(rdmsr -p "$1" "$2" 2>/dev/null) || return 1
+    [ -n "$out" ] || return 1
+
+    echo $((16#$out))
+}
+
+list_cpus() {
+    local path
+
+    for path in /dev/cpu/[0-9]*; do
+        [ -e "$path/msr" ] || continue
+        echo "${path#/dev/cpu/}"
+    done | sort -n
+}
+
+# Writes a value only when the masked bits differ, then reads it back
+# and verifies that the masked bits have the requested value.
+write_msr_verified() {
+    local cpu=$1
+    local reg=$2
+    local value=$3
+    local mask=$4
+    local current
+    local readback
+
+    current=$(read_msr "$cpu" "$reg") || return 1
+
+    if (((current & mask) == (value & mask))); then
+        return 0
+    fi
+
+    wrmsr -p "$cpu" "$reg" "$(printf '0x%x' "$value")" 2>/dev/null ||
+        return 1
+
+    readback=$(read_msr "$cpu" "$reg") || return 1
+
+    (((readback & mask) == (value & mask)))
 }
 
 get_secure_boot_state() {
@@ -229,6 +293,11 @@ ensure_msr_tools() {
     echo "Installing msr-tools..."
     apt-get update
     apt-get install -y msr-tools
+
+    if ! command -v rdmsr >/dev/null 2>&1 ||
+       ! command -v wrmsr >/dev/null 2>&1; then
+        die "msr-tools was installed but rdmsr/wrmsr are still not available."
+    fi
 }
 
 load_msr_module() {
@@ -280,6 +349,20 @@ check_msr_access() {
         return 1
     fi
 
+    if ! grep -qw hwp /proc/cpuinfo; then
+        printf '%-22s %s\n' "HWP support:" "not reported by the CPU"
+        return 1
+    fi
+
+    local pm_enable
+    pm_enable=$(read_msr 0 0x770) || pm_enable=0
+
+    if ! ((pm_enable & 1)); then
+        printf '%-22s %s\n' "HWP enabled:" "no (IA32_PM_ENABLE bit 0 clear)"
+        return 1
+    fi
+
+    printf '%-22s %s\n' "HWP enabled:" "yes"
     printf '%-22s %s\n' "MSR access:" "available"
     return 0
 }
@@ -304,10 +387,6 @@ show_cpu_identity() {
 }
 
 show_calculated_values() {
-    local misc_hex
-    local hwp_cap_hex
-    local hwp_req_hex
-
     local misc
     local hwp_cap
     local hwp_req
@@ -317,21 +396,28 @@ show_calculated_values() {
     local current_hwp_max
     local new_hwp
 
-    misc_hex=$(rdmsr -p 0 0x1a0)
-    hwp_cap_hex=$(rdmsr -p 0 0x771)
-    hwp_req_hex=$(rdmsr -p 0 0x774)
+    local cpu
+    local total=0
+    local pending=0
+    local c_misc
+    local c_cap
+    local c_req
 
-    misc=$((16#$misc_hex))
-    hwp_cap=$((16#$hwp_cap_hex))
-    hwp_req=$((16#$hwp_req_hex))
+    misc=$(read_msr 0 0x1a0) || { echo "ERROR: cannot read IA32_MISC_ENABLE." >&2; return 1; }
+    hwp_cap=$(read_msr 0 0x771) || { echo "ERROR: cannot read IA32_HWP_CAPABILITIES." >&2; return 1; }
+    hwp_req=$(read_msr 0 0x774) || { echo "ERROR: cannot read IA32_HWP_REQUEST." >&2; return 1; }
 
     new_misc=$((misc & ~(1 << 38)))
     hwp_max=$((hwp_cap & 0xff))
     current_hwp_max=$(((hwp_req >> 8) & 0xff))
-    new_hwp=$(((hwp_req & ~(0xff << 8)) | (hwp_max << 8)))
+    new_hwp=$hwp_req
+
+    if ((current_hwp_max < hwp_max)); then
+        new_hwp=$(((hwp_req & ~(0xff << 8)) | (hwp_max << 8)))
+    fi
 
     echo
-    echo "MSR analysis:"
+    echo "MSR analysis (CPU 0):"
     printf '%-31s 0x%x\n' "IA32_MISC_ENABLE:" "$misc"
     printf '%-31s 0x%x\n' "Proposed IA32_MISC_ENABLE:" "$new_misc"
     printf '%-31s 0x%x\n' "IA32_HWP_CAPABILITIES:" "$hwp_cap"
@@ -344,15 +430,15 @@ show_calculated_values() {
 
     if ((misc & (1 << 38))); then
         printf '%-31s %s\n' \
-            "Dell/BIOS restriction bit:" \
-            "set"
+            "Turbo disable bit (38):" \
+            "set (turbo disabled)"
     else
         printf '%-31s %s\n' \
-            "Dell/BIOS restriction bit:" \
+            "Turbo disable bit (38):" \
             "clear"
     fi
 
-    if ((current_hwp_max == hwp_max)); then
+    if ((current_hwp_max >= hwp_max)); then
         printf '%-31s %s\n' \
             "HWP maximum request:" \
             "already unrestricted"
@@ -361,6 +447,21 @@ show_calculated_values() {
             "HWP maximum request:" \
             "currently restricted"
     fi
+
+    for cpu in $(list_cpus); do
+        total=$((total + 1))
+
+        c_misc=$(read_msr "$cpu" 0x1a0) || continue
+        c_cap=$(read_msr "$cpu" 0x771) || continue
+        c_req=$(read_msr "$cpu" 0x774) || continue
+
+        if ((c_misc & (1 << 38))) ||
+           ((((c_req >> 8) & 0xff) < (c_cap & 0xff))); then
+            pending=$((pending + 1))
+        fi
+    done
+
+    printf '%-31s %s of %s\n' "CPUs needing changes:" "$pending" "$total"
 }
 
 show_all_msr_values() {
@@ -369,15 +470,15 @@ show_all_msr_values() {
 
     echo
     echo "IA32_MISC_ENABLE:"
-    rdmsr -a 0x1a0
+    rdmsr -a 0x1a0 || true
 
     echo
     echo "IA32_HWP_CAPABILITIES:"
-    rdmsr -a 0x771
+    rdmsr -a 0x771 || true
 
     echo
     echo "IA32_HWP_REQUEST:"
-    rdmsr -a 0x774
+    rdmsr -a 0x774 || true
 }
 
 show_frequencies() {
@@ -409,113 +510,134 @@ show_frequencies() {
 }
 
 apply_workaround() {
-    local path
+    local -a cpus=()
+    local -a plan_cpu=()
+    local -a plan_misc=()
+    local -a plan_hwp=()
+
     local cpu
-
-    local current
+    local i
+    local pm_enable
+    local misc
     local cap
-    local request
-
-    local current_value
-    local cap_value
-    local request_value
-
-    local new_misc
+    local req
     local hwp_max
+    local cur_max
+    local min_perf
+    local new_misc
     local new_hwp
+    local total
+    local failed=0
 
-    modprobe msr
+    mapfile -t cpus < <(list_cpus)
 
-    for path in /dev/cpu/[0-9]*; do
-        [ -d "$path" ] || continue
-        cpu=${path#/dev/cpu/}
+    if [ "${#cpus[@]}" -eq 0 ]; then
+        echo "ERROR: No /dev/cpu/N/msr devices found." >&2
+        return 1
+    fi
 
-        current=$(rdmsr -p "$cpu" 0x1a0)
-        current_value=$((16#$current))
+    # Phase 1: read and validate every CPU before changing anything.
+    for cpu in "${cpus[@]}"; do
+        pm_enable=$(read_msr "$cpu" 0x770) || pm_enable=0
 
-        # Clear only IA32_MISC_ENABLE bit 38.
-        new_misc=$((current_value & ~(1 << 38)))
+        if ! ((pm_enable & 1)); then
+            echo "ERROR: HWP is not enabled on CPU $cpu." >&2
+            return 1
+        fi
 
-        wrmsr -p "$cpu" 0x1a0 \
-            "$(printf '0x%x' "$new_misc")"
-
-        cap=$(rdmsr -p "$cpu" 0x771)
-        request=$(rdmsr -p "$cpu" 0x774)
-
-        cap_value=$((16#$cap))
-        request_value=$((16#$request))
+        misc=$(read_msr "$cpu" 0x1a0) || {
+            echo "ERROR: Cannot read IA32_MISC_ENABLE on CPU $cpu." >&2
+            return 1
+        }
+        cap=$(read_msr "$cpu" 0x771) || {
+            echo "ERROR: Cannot read IA32_HWP_CAPABILITIES on CPU $cpu." >&2
+            return 1
+        }
+        req=$(read_msr "$cpu" 0x774) || {
+            echo "ERROR: Cannot read IA32_HWP_REQUEST on CPU $cpu." >&2
+            return 1
+        }
 
         # IA32_HWP_CAPABILITIES bits 7:0 contain Highest_Performance.
-        hwp_max=$((cap_value & 0xff))
+        hwp_max=$((cap & 0xff))
 
-        # Replace only IA32_HWP_REQUEST Maximum_Performance bits 15:8.
-        new_hwp=$(
-            (request_value & ~(0xff << 8)) |
-            (hwp_max << 8)
-        )
+        # IA32_HWP_REQUEST bits 15:8 are Maximum_Performance,
+        # bits 7:0 are Minimum_Performance.
+        cur_max=$(((req >> 8) & 0xff))
+        min_perf=$((req & 0xff))
 
-        wrmsr -p "$cpu" 0x774 \
-            "$(printf '0x%x' "$new_hwp")"
+        if [ "$hwp_max" -eq 0 ] || [ "$hwp_max" -lt "$min_perf" ]; then
+            printf 'ERROR: CPU %s advertises an invalid Highest_Performance (0x%x, minimum request 0x%x).\n' \
+                "$cpu" "$hwp_max" "$min_perf" >&2
+            return 1
+        fi
+
+        # Clear only IA32_MISC_ENABLE bit 38.
+        new_misc=$((misc & ~(1 << 38)))
+
+        # Only ever raise Maximum_Performance, never lower it.
+        new_hwp=$req
+        if [ "$cur_max" -lt "$hwp_max" ]; then
+            new_hwp=$(((req & ~(0xff << 8)) | (hwp_max << 8)))
+        fi
+
+        plan_cpu+=("$cpu")
+        plan_misc+=("$new_misc")
+        plan_hwp+=("$new_hwp")
     done
+
+    # Phase 2: apply and verify.
+    for i in "${!plan_cpu[@]}"; do
+        cpu=${plan_cpu[$i]}
+
+        if ! write_msr_verified "$cpu" 0x1a0 "${plan_misc[$i]}" $((1 << 38)); then
+            echo "ERROR: Failed to update IA32_MISC_ENABLE on CPU $cpu." >&2
+            failed=1
+            continue
+        fi
+
+        if ! write_msr_verified "$cpu" 0x774 "${plan_hwp[$i]}" $((0xff << 8)); then
+            echo "ERROR: Failed to update IA32_HWP_REQUEST on CPU $cpu." >&2
+            failed=1
+            continue
+        fi
+
+        echo "CPU $cpu: OK"
+    done
+
+    total=$(nproc --all 2>/dev/null || echo "${#cpus[@]}")
+    if [ "$total" -gt "${#cpus[@]}" ]; then
+        echo "NOTE: $((total - ${#cpus[@]})) offline CPU(s) were skipped."
+    fi
+
+    return "$failed"
 }
 
-write_worker() {
-    cat > "$WORKER" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
+install_worker() {
+    if [ ! -f "$SELF" ]; then
+        die "Cannot locate this script on disk (\$0=$0); run it from a file."
+    fi
 
-modprobe msr
-
-for path in /dev/cpu/[0-9]*; do
-    [ -d "$path" ] || continue
-    cpu=${path#/dev/cpu/}
-
-    current=$(rdmsr -p "$cpu" 0x1a0)
-    current_value=$((16#$current))
-
-    # Clear only IA32_MISC_ENABLE bit 38.
-    new_misc=$((current_value & ~(1 << 38)))
-
-    wrmsr -p "$cpu" 0x1a0 \
-        "$(printf '0x%x' "$new_misc")"
-
-    cap=$(rdmsr -p "$cpu" 0x771)
-    request=$(rdmsr -p "$cpu" 0x774)
-
-    cap_value=$((16#$cap))
-    request_value=$((16#$request))
-
-    # Use this logical CPU's advertised Highest_Performance value.
-    hwp_max=$((cap_value & 0xff))
-
-    # Replace only HWP Maximum_Performance bits 15:8.
-    new_hwp=$(
-        (request_value & ~(0xff << 8)) |
-        (hwp_max << 8)
-    )
-
-    wrmsr -p "$cpu" 0x774 \
-        "$(printf '0x%x' "$new_hwp")"
-done
-EOF
-
-    chmod 755 "$WORKER"
+    if [ "$SELF" != "$WORKER" ]; then
+        install -m 755 "$SELF" "$WORKER"
+    fi
 }
 
+# No RemainAfterExit: the unit must become inactive after each run so
+# that the sleep targets can start it again after resume.
 write_service() {
     cat > "$SERVICE" <<EOF
 [Unit]
 Description=DellThrottleFix adaptive CPU unthrottle workaround
-After=multi-user.target
+After=systemd-modules-load.service suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
 ConditionPathExists=$WORKER
 
 [Service]
 Type=oneshot
-ExecStart=$WORKER
-RemainAfterExit=yes
+ExecStart=$WORKER --apply
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
 EOF
 }
 
@@ -538,7 +660,7 @@ do_check() {
     if ! check_msr_access; then
         failed=1
     else
-        show_calculated_values
+        show_calculated_values || failed=1
         show_frequencies
     fi
 
@@ -551,6 +673,7 @@ do_check() {
 
     echo "CHECK RESULT: Ready."
     echo "No packages, files, services or MSRs were changed."
+    echo "(The msr kernel module may have been loaded; this does not persist across reboots.)"
 }
 
 do_status() {
@@ -576,8 +699,12 @@ do_status() {
     if systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
         printf '%-22s %s\n' "Service active:" "yes"
     else
-        printf '%-22s %s\n' "Service active:" "no"
+        printf '%-22s %s\n' "Service active:" "no (normal: it exits after each run)"
     fi
+
+    printf '%-22s %s\n' \
+        "Last run result:" \
+        "$(systemctl show -p Result --value "$SERVICE_NAME" 2>/dev/null || echo unknown)"
 
     if [ -f "$WORKER" ]; then
         printf '%-22s %s\n' "Worker installed:" "yes"
@@ -594,17 +721,35 @@ do_status() {
     echo
 
     if check_msr_access; then
-        show_calculated_values
+        show_calculated_values || true
         show_all_msr_values
         show_frequencies
     fi
 }
 
+require_intel_and_unlocked() {
+    show_cpu_identity || die "An Intel processor is required."
+    security_check || exit 1
+}
+
+do_apply() {
+    require_root
+
+    security_check || exit 1
+
+    if ! command -v rdmsr >/dev/null 2>&1 ||
+       ! command -v wrmsr >/dev/null 2>&1; then
+        die "rdmsr/wrmsr are not installed (msr-tools)."
+    fi
+
+    load_msr_module
+    apply_workaround
+}
+
 do_run_once() {
     require_root
 
-    show_cpu_identity
-    security_check
+    require_intel_and_unlocked
     ensure_msr_tools
     load_msr_module
 
@@ -615,7 +760,7 @@ do_run_once() {
 
     echo
     echo "Applying temporary workaround..."
-    apply_workaround
+    apply_workaround || die "The workaround could not be fully applied."
 
     sleep 1
 
@@ -634,8 +779,7 @@ do_run_once() {
 do_install() {
     require_root
 
-    show_cpu_identity
-    security_check
+    require_intel_and_unlocked
     ensure_msr_tools
     load_msr_module
 
@@ -644,8 +788,8 @@ do_install() {
     show_calculated_values
 
     echo
-    echo "Creating adaptive worker and systemd service..."
-    write_worker
+    echo "Installing worker and systemd service..."
+    install_worker
     write_service
 
     systemctl daemon-reload
@@ -663,7 +807,7 @@ do_install() {
 
     echo
     echo "Installation completed successfully."
-    echo "$PROGRAM_NAME will now run automatically during boot."
+    echo "$PROGRAM_NAME will now run automatically during boot and after resume."
 }
 
 do_uninstall() {
@@ -716,6 +860,9 @@ case "$1" in
         ;;
     --uninstall)
         do_uninstall
+        ;;
+    --apply)
+        do_apply
         ;;
     *)
         echo "ERROR: Unknown option: $1" >&2
